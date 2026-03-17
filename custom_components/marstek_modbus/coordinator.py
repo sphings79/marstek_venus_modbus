@@ -362,8 +362,21 @@ class MarstekCoordinator(DataUpdateCoordinator):
             return False
 
         try:
-            success = await self.client.async_write_register(register=register, value=value_to_send)
-            
+            import asyncio as _asyncio
+            try:
+                success = await _asyncio.wait_for(
+                    self.client.async_write_register(register=register, value=value_to_send),
+                    timeout=10.0,
+                )
+            except _asyncio.TimeoutError:
+                _LOGGER.error(
+                    "Timeout writing to register 0x%X for %s '%s' - connection may be half-open",
+                    register,
+                    entity_type,
+                    key,
+                )
+                return False
+
             if success:
                 _LOGGER.debug(
                     "Successfully wrote to %s '%s': register=%d (0x%04X), value=%s, scale=%s, unit=%s",
@@ -627,12 +640,12 @@ class MarstekCoordinator(DataUpdateCoordinator):
                     _LOGGER.error("Exception during immediate reconnect: %s", exc)
                 
                 if self._consecutive_failures >= self._max_consecutive_failures:
-                    # Too many failures - suspend connection attempts for 5 minutes
+                    # Too many failures - suspend connection attempts for 1 minute
                     self._connection_suspended = True
-                    self._suspension_reset_time = now + timedelta(minutes=5)
+                    self._suspension_reset_time = now + timedelta(minutes=1)
                     _LOGGER.error(
                         "Connection suspended after %d consecutive failures. "
-                        "Will retry in 5 minutes to prevent resource exhaustion.",
+                        "Will retry in 1 minute to prevent resource exhaustion.",
                         self._consecutive_failures
                     )
                 self._consecutive_timeout_cycles = 0
