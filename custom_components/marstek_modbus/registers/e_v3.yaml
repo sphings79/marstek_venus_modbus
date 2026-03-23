@@ -1047,7 +1047,6 @@ STORED_ENERGY_SENSOR_DEFINITIONS:
 CYCLE_SENSOR_DEFINITIONS:
     battery_cycle_count_calc:
         key: battery_cycle_count_calc
-        unit: cycles
         icon: "mdi:counter"
         category: diagnostic
         state_class: measurement
