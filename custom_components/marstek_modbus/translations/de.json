@@ -215,6 +215,15 @@
       "battery_1_cell_13_voltage": {
         "name": "Batteriepack 1 Zelle 13 Spannung"
       },
+      "battery_1_cell_14_voltage": {
+        "name": "Batteriepack 1 Zelle 14 Spannung"
+      },
+      "battery_1_cell_15_voltage": {
+        "name": "Batteriepack 1 Zelle 15 Spannung"
+      },
+      "battery_1_cell_16_voltage": {
+        "name": "Batteriepack 1 Zelle 16 Spannung"
+      },
       "battery_2_cell_1_voltage": {
         "name": "Batteriepack 2 Zelle 1 Spannung"
       },
