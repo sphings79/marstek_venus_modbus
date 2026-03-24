@@ -150,10 +150,10 @@
         "name": "Total Discharging Energy"
       },
       "battery_cycle_count": {
-        "name": "Full Cycles (BMS)"
+        "name": "Cycle Count"
       },
       "battery_cycle_count_calc": {
-        "name": "Full Cycles (calculated)"
+        "name": "Cycle Count (Calc)"
       },
       "total_daily_charging_energy": {
         "name": "Daily Charging Energy"
@@ -217,6 +217,15 @@
       },
       "battery_1_cell_13_voltage": {
         "name": "Battery Pack 1 Cell 13 Voltage"
+      },
+      "battery_1_cell_14_voltage": {
+        "name": "Battery Pack 1 Cell 14 Voltage"
+      },
+      "battery_1_cell_15_voltage": {
+        "name": "Battery Pack 1 Cell 15 Voltage"
+      },
+      "battery_1_cell_16_voltage": {
+        "name": "Battery Pack 1 Cell 16 Voltage"
       },
       "battery_2_cell_1_voltage": {
         "name": "Battery Pack 2 Cell 1 Voltage"
@@ -503,6 +512,7 @@
       "mppt4_power": {
         "name": "MPPT4 Power"
       },
+
       "bluetooth_status": {
         "name": "Bluetooth Status",
         "state": {
@@ -515,16 +525,17 @@
       }
     },
     "binary_sensor": {
-      "wifi_status": {
-        "name": "WiFi Status"
+      "wifi_status": { 
+        "name": "WiFi Status" 
       },
-      "cloud_status": {
-        "name": "Cloud Status"
+      "cloud_status": { 
+        "name": "Cloud Status" 
       },
-      "discharge_limit_mode": {
-        "name": "Discharge Limit"
+      "discharge_limit_mode": { 
+        "name": "Discharge Limit" 
       }
     },
+
     "select": {
       "user_work_mode": {
         "name": "User Work Mode",
@@ -630,6 +641,7 @@
         }
       }
     },
+
     "switch": {
       "backup_function": {
         "name": "Backup Function"
@@ -696,6 +708,7 @@
       "schedule_6_start": {
         "name": "Schedule 6 Start"
       },
+
       "schedule_1_end": {
         "name": "Schedule 1 End"
       },
