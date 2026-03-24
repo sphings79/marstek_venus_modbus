@@ -224,6 +224,15 @@
       "battery_1_cell_13_voltage": {
         "name": "Batterij pack 1 Cel 13 Spanning"
       },
+      "battery_1_cell_14_voltage": {
+        "name": "Batterij pack 1 Cel 14 Spanning"
+      },
+      "battery_1_cell_15_voltage": {
+        "name": "Batterij pack 1 Cel 15 Spanning"
+      },
+      "battery_1_cell_16_voltage": {
+        "name": "Batterij pack 1 Cel 16 Spanning"
+      },
       "battery_2_cell_1_voltage": {
         "name": "Batterij pack 2 Cel 1 Spanning"
       },
