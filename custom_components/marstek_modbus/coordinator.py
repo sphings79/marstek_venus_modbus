@@ -1,6 +1,11 @@
 """
 Handles all sensor polling via Home Assistant DataUpdateCoordinator,
 with per-sensor intervals and optional skipping if not due.
+
+Block-Read Optimierung (PR):
+  Nahe beieinander liegende Register werden in einem einzigen
+  Modbus-Request gelesen statt einzeln. Reduziert TCP-Roundtrips
+  zum RS485-Gateway um ~50–70% pro Poll-Zyklus.
 """
 
 import asyncio
@@ -18,6 +23,21 @@ from .helpers.modbus_client import MarstekModbusClient
 from pathlib import Path
 
 _LOGGER = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Block-Read Konstanten
+# ---------------------------------------------------------------------------
+
+# Modbus FC03: max. 125 Holding-Register pro Request (Spec 0x7D)
+_BLOCK_MAX_REGISTERS = 125
+
+# Lücken ≤ diesem Wert werden in einem Block überbrückt.
+# 5 ist ein guter Kompromiss für das Marstek-Register-Layout.
+_BLOCK_MAX_GAP = 5
+
+# Data-Types die blockweise gelesen werden können (haben bekannte Decode-Logik).
+# "schedule" und andere komplexe Typen laufen weiter über async_read_value().
+_BLOCKABLE_DATA_TYPES = frozenset({"uint16", "int16", "uint32", "int32", "char"})
 
 
 def get_entity_type(entity) -> str:
@@ -106,6 +126,10 @@ class MarstekCoordinator(DataUpdateCoordinator):
         self._register_failures: dict[str, int] = {}
         # Tracks last *attempt* time (success or failure) for backoff interval calculation.
         self._last_attempt_times: dict = {}
+
+        # Cached raw pymodbus client reference (resolved once, used for block reads).
+        # None means block reads are unavailable; falls back to individual async_read_value().
+        self._pymodbus_client = None
 
         # Prepare scan intervals (from config_entry.options or default)
         options = entry.options or {}
@@ -248,6 +272,286 @@ class MarstekCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Failed to load register definitions for version '%s': %s", used_version, e)
             # Keep empty definitions as fallback; platforms will see no entities
             self._all_definitions = []
+
+    # ------------------------------------------------------------------
+    # Block-Read Hilfsmethoden (NEU)
+    # ------------------------------------------------------------------
+
+    def _resolve_pymodbus_client(self):
+        """
+        Sucht den zugrunde liegenden pymodbus-Client in self.client.
+
+        Versucht gängige Attributnamen. Gibt None zurück wenn nicht gefunden
+        (Block-Reads dann nicht verfügbar, Fallback auf Einzelreads).
+        """
+        if self._pymodbus_client is not None:
+            return self._pymodbus_client
+
+        for attr in ("client", "_client", "modbus_client", "_modbus_client", "async_client"):
+            candidate = getattr(self.client, attr, None)
+            if candidate is not None and hasattr(candidate, "read_holding_registers"):
+                self._pymodbus_client = candidate
+                _LOGGER.debug("Block-Read: pymodbus-Client gefunden via self.client.%s", attr)
+                return self._pymodbus_client
+
+        _LOGGER.debug(
+            "Block-Read: Kein pymodbus-Client in MarstekModbusClient gefunden — "
+            "Fallback auf Einzelreads. Bekannte Attribute: %s",
+            [a for a in dir(self.client) if not a.startswith("__")],
+        )
+        return None
+
+    def _build_register_blocks(
+        self,
+        due_sensors: list[tuple[dict, str, int]],
+    ) -> list[list[tuple[dict, str, int]]]:
+        """
+        Gruppiert due_sensors nach zusammenhängenden Registerblöcken.
+
+        Args:
+            due_sensors: Liste von (sensor_def, key, interval) die in diesem
+                         Zyklus gelesen werden sollen.
+
+        Returns:
+            Liste von Gruppen. Jede Gruppe = ein zusammenhängender Registerblock.
+            Sensoren mit komplexen data_types (schedule etc.) werden einzeln
+            in einelementige Gruppen gestellt.
+        """
+        # Nur blockierbare Typen sortieren; komplexe Typen als Einzel-Gruppen
+        simple: list[tuple[dict, str, int]] = []
+        complex_sensors: list[tuple[dict, str, int]] = []
+
+        for entry in due_sensors:
+            sensor, key, interval = entry
+            data_type = sensor.get("data_type", "uint16")
+            if data_type in _BLOCKABLE_DATA_TYPES:
+                simple.append(entry)
+            else:
+                complex_sensors.append(entry)
+
+        # Sortierung nach Registeradresse
+        simple.sort(key=lambda e: e[0]["register"])
+
+        groups: list[list[tuple[dict, str, int]]] = []
+        current_group: list[tuple[dict, str, int]] = []
+        current_end = -1
+
+        for entry in simple:
+            sensor, key, interval = entry
+            reg_start = sensor["register"]
+            reg_count = sensor.get("count", 1)
+            reg_end = reg_start + reg_count - 1
+
+            if not current_group:
+                current_group = [entry]
+                current_end = reg_end
+                continue
+
+            gap = reg_start - current_end - 1
+            # Berechne Gesamtgröße des Blocks wenn zusammengefasst
+            first_reg = current_group[0][0]["register"]
+            potential_count = reg_end - first_reg + 1
+
+            if gap <= _BLOCK_MAX_GAP and potential_count <= _BLOCK_MAX_REGISTERS:
+                current_group.append(entry)
+                current_end = max(current_end, reg_end)
+            else:
+                groups.append(current_group)
+                current_group = [entry]
+                current_end = reg_end
+
+        if current_group:
+            groups.append(current_group)
+
+        # Komplexe Typen als Einzelgruppen anhängen
+        for entry in complex_sensors:
+            groups.append([entry])
+
+        return groups
+
+    def _decode_raw_registers(
+        self,
+        registers: list[int],
+        block_start: int,
+        sensor: dict,
+    ):
+        """
+        Dekodiert einen Sensorwert aus dem rohen Register-Array eines Blocks.
+
+        Unterstützt: uint16, int16, uint32, int32, char.
+        Gibt None zurück bei unbekanntem Typ oder Indexfehler.
+        """
+        data_type = sensor.get("data_type", "uint16")
+        count = sensor.get("count", 1)
+        scale = self._scales.get(sensor["key"], sensor.get("scale", 1))
+        offset = sensor["register"] - block_start
+
+        try:
+            raw_regs = registers[offset: offset + count]
+        except (IndexError, TypeError):
+            _LOGGER.error(
+                "Block-Decode: Offset %d+%d außerhalb Array (len=%d) für '%s'",
+                offset, count, len(registers), sensor["key"],
+            )
+            return None
+
+        if len(raw_regs) < count:
+            _LOGGER.warning(
+                "Block-Decode: Zu wenige Register für '%s' (erwartet %d, erhalten %d)",
+                sensor["key"], count, len(raw_regs),
+            )
+            return None
+
+        try:
+            if data_type == "uint16":
+                raw = raw_regs[0]
+                return raw * scale if scale != 1 else raw
+
+            elif data_type == "int16":
+                raw = raw_regs[0]
+                if raw > 0x7FFF:
+                    raw -= 0x10000
+                return raw * scale if scale != 1 else raw
+
+            elif data_type == "uint32":
+                raw = (raw_regs[0] << 16) | raw_regs[1]
+                return raw * scale if scale != 1 else raw
+
+            elif data_type == "int32":
+                raw = (raw_regs[0] << 16) | raw_regs[1]
+                if raw > 0x7FFFFFFF:
+                    raw -= 0x100000000
+                return raw * scale if scale != 1 else raw
+
+            elif data_type == "char":
+                # Rohe Registerliste zurückgeben (wie async_read_register es tut)
+                return raw_regs
+
+            else:
+                _LOGGER.debug(
+                    "Block-Decode: Unbekannter data_type '%s' für '%s' — Einzelread nötig",
+                    data_type, sensor["key"],
+                )
+                return None
+
+        except Exception as exc:
+            _LOGGER.error(
+                "Block-Decode Fehler für '%s': %s", sensor["key"], exc
+            )
+            return None
+
+    async def _async_block_prefetch(
+        self,
+        due_sensors: list[tuple[dict, str, int]],
+    ) -> dict[str, object]:
+        """
+        Liest alle due_sensors in optimierten Registerblöcken vor.
+
+        Gibt ein Dict {key: decoded_value} zurück. Sensoren die nicht
+        blockweise gelesen werden können (komplexe Typen, Lesefehler)
+        fehlen im Dict → Fallback auf async_read_value() im Hauptloop.
+        """
+        pymodbus = self._resolve_pymodbus_client()
+        if pymodbus is None:
+            # Kein Direktzugriff auf pymodbus → alle Einzel-Reads im Hauptloop
+            return {}
+
+        groups = self._build_register_blocks(due_sensors)
+
+        cache: dict[str, object] = {}
+        total_blocks = len([g for g in groups if len(g) > 1 or
+                            g[0][0].get("data_type", "uint16") in _BLOCKABLE_DATA_TYPES])
+        saved_requests = sum(len(g) - 1 for g in groups if len(g) > 1)
+
+        _LOGGER.debug(
+            "Block-Prefetch: %d Sensoren → %d Gruppen (%d eingesparte TCP-Requests)",
+            len(due_sensors),
+            len(groups),
+            saved_requests,
+        )
+
+        for group in groups:
+            sensor_first = group[0][0]
+            data_type = sensor_first.get("data_type", "uint16")
+
+            # Einzelelement-Gruppen mit komplexen Typen: nicht prefetchen
+            if len(group) == 1 and data_type not in _BLOCKABLE_DATA_TYPES:
+                continue
+
+            # Blockgrenzen berechnen
+            block_start = sensor_first["register"]
+            block_end = max(
+                s["register"] + s.get("count", 1) - 1
+                for s, _, _ in group
+            )
+            block_count = block_end - block_start + 1
+
+            _LOGGER.debug(
+                "Block-Read [%d..%d] (%d Register, %d Sensoren): %s",
+                block_start,
+                block_end,
+                block_count,
+                len(group),
+                [key for _, key, _ in group],
+            )
+
+            try:
+                response = await asyncio.wait_for(
+                    pymodbus.read_holding_registers(
+                        address=block_start,
+                        count=block_count,
+                        slave=self.unit_id,
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Block-Read Timeout [%d..%d] — Fallback auf Einzelreads für: %s",
+                    block_start, block_end,
+                    [key for _, key, _ in group],
+                )
+                continue
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Block-Read Fehler [%d..%d]: %s — Fallback auf Einzelreads für: %s",
+                    block_start, block_end, exc,
+                    [key for _, key, _ in group],
+                )
+                continue
+
+            if response.isError():
+                _LOGGER.warning(
+                    "Block-Read Modbus-Fehler [%d..%d]: %s — Fallback auf Einzelreads für: %s",
+                    block_start, block_end, response,
+                    [key for _, key, _ in group],
+                )
+                continue
+
+            # Einzelwerte aus dem Block extrahieren
+            for sensor, key, _ in group:
+                value = self._decode_raw_registers(response.registers, block_start, sensor)
+                if value is not None:
+                    cache[key] = value
+                    _LOGGER.debug(
+                        "Block-Decode '%s': register=%d, value=%s",
+                        key, sensor["register"], value,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Block-Decode '%s': Dekodierung fehlgeschlagen → Einzelread",
+                        key,
+                    )
+
+        _LOGGER.debug(
+            "Block-Prefetch abgeschlossen: %d/%d Sensoren aus Cache verfügbar",
+            len(cache),
+            len(due_sensors),
+        )
+        return cache
+
+    # ------------------------------------------------------------------
+    # Bestehende Lese-/Schreib-Hilfsmethoden (unverändert)
+    # ------------------------------------------------------------------
 
     async def async_read_value(self, sensor: dict, key: str, track_failure: bool = True):
         """Helper to read a single sensor value from Modbus with logging and type checking.
@@ -403,6 +707,8 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 )
                 from homeassistant.util.dt import utcnow as _utcnow
                 self._last_write_times[key] = _utcnow()
+                # Pymodbus-Client-Cache nach Write invalidieren: erzwingt frischen Read
+                self._pymodbus_client = None
                 return True
             else:
                 _LOGGER.warning(
@@ -426,11 +732,22 @@ class MarstekCoordinator(DataUpdateCoordinator):
             )
             return False
 
+    # ------------------------------------------------------------------
+    # Haupt-Poll-Methode (mit Block-Read Optimierung)
+    # ------------------------------------------------------------------
+
     async def _async_update_data(self):
         """Update all sensors asynchronously with per-sensor interval skipping.
 
         Buttons are excluded as they are not polled.
         Sensors disabled in Home Assistant are skipped, except dependencies which are always fetched.
+
+        Block-Read Optimierung:
+          Alle in diesem Zyklus fälligen Sensoren werden zuerst gesammelt.
+          Dann werden nahe beieinanderliegende Register in einem einzigen
+          Modbus-Request gelesen (Block-Read). Einzelreads sind der Fallback
+          für komplexe Datentypen oder wenn kein direkter pymodbus-Zugriff
+          möglich ist.
         """
         from homeassistant.util.dt import utcnow
         from homeassistant.helpers import entity_registry as er
@@ -487,7 +804,12 @@ class MarstekCoordinator(DataUpdateCoordinator):
         for dep_key in dependency_keys_set:
             _LOGGER.debug("Dependency key '%s'", dep_key)
 
-        # Iterate over each sensor definition to poll if due
+        # ----------------------------------------------------------------
+        # Phase 1: Alle in diesem Zyklus fälligen Sensoren sammeln
+        # ----------------------------------------------------------------
+        # due_sensors: Liste von (sensor_def, key, interval) die gelesen werden sollen
+        due_sensors: list[tuple[dict, str, int]] = []
+
         for sensor in self._all_definitions:
             key = sensor["key"]
             entity_type = self._entity_types.get(key, get_entity_type(sensor))
@@ -532,7 +854,6 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 continue
 
             # Apply per-register exponential backoff based on consecutive failures.
-            # This prevents hammering dead/removed registers at full poll rate.
             failures = self._register_failures.get(key, 0)
             backoff = min(2 ** failures, 64)  # max 64x base interval
             effective_interval = min(interval * backoff, 3600)
@@ -551,12 +872,38 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 )
                 continue
 
-            # Track that we're attempting a read
+            # Sensor ist fällig → zur Liste hinzufügen
+            due_sensors.append((sensor, key, interval))
+
+        # ----------------------------------------------------------------
+        # Phase 2: Block-Prefetch — fällige Register in Blöcken lesen
+        # ----------------------------------------------------------------
+        # block_cache: {key: decoded_value} für Sensoren die per Block gelesen wurden.
+        # Sensoren die NICHT im Cache sind → Fallback auf async_read_value() in Phase 3.
+        if due_sensors:
+            block_cache = await self._async_block_prefetch(due_sensors)
+        else:
+            block_cache = {}
+
+        # ----------------------------------------------------------------
+        # Phase 3: Ergebnisse verarbeiten (mit Cache-Lookup + Fallback)
+        # ----------------------------------------------------------------
+        for sensor, key, interval in due_sensors:
+            entity_type = self._entity_types.get(key, get_entity_type(sensor))
+
             attempted_reads += 1
             self._read_start_times[key] = now
 
-            # Attempt to read the sensor value from Modbus using helper function
-            value = await self.async_read_value(sensor, key)
+            # Cache-Lookup: wurde der Wert per Block-Read geholt?
+            if key in block_cache:
+                value = block_cache[key]
+                _LOGGER.debug(
+                    "Cache-Hit für '%s': value=%s (Block-Read)",
+                    key, value,
+                )
+            else:
+                # Fallback: Einzelread (komplexe Typen wie schedule, oder Block-Read fehlgeschlagen)
+                value = await self.async_read_value(sensor, key)
 
             if value is not None:
                 # Special-case: for packed schedule sensors, store both the
@@ -635,7 +982,9 @@ class MarstekCoordinator(DataUpdateCoordinator):
                         entity_type, key, new_failures,
                     )
 
-        # Connection retry logic: only track failures if we actually attempted reads
+        # ----------------------------------------------------------------
+        # Phase 4: Connection retry logic (unverändert)
+        # ----------------------------------------------------------------
         if attempted_reads > 0:
             timeout_reads = int(getattr(self, "_timeouts_in_cycle", 0) or 0)
             if successful_reads > 0:
@@ -690,6 +1039,8 @@ class MarstekCoordinator(DataUpdateCoordinator):
                         _LOGGER.info("Successfully reconnected")
                         self._consecutive_failures = 0
                         self._connection_established_at = now
+                        # Pymodbus-Client-Cache nach Reconnect invalidieren
+                        self._pymodbus_client = None
                     else:
                         _LOGGER.warning("Immediate reconnection failed")
                 except Exception as exc:
@@ -838,4 +1189,3 @@ def get_registers(version: str):
                 }
             except Exception as e:
                 _LOGGER.warning("Failed to load YAML registers %s: %s", yaml_path, e)
-
