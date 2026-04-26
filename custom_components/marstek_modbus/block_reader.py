@@ -32,7 +32,7 @@ BLOCK_MAX_REGISTERS: int = 125
 # Gaps of this many registers or fewer are bridged within a single block read.
 # Bridged registers are read but their values are discarded.
 # 5 is a good balance for the Marstek Venus register layout.
-BLOCK_MAX_GAP: int = 5
+BLOCK_MAX_GAP: int = 15
 
 # Data types that can be decoded from a raw register array.
 # Types not listed here (e.g. "schedule") fall back to individual reads.
